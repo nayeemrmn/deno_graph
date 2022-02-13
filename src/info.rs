@@ -4,8 +4,8 @@ use crate::colors;
 use crate::graph::Dependency;
 use crate::graph::EsModule;
 use crate::graph::Module;
+use crate::graph::ModuleError;
 use crate::graph::ModuleGraph;
-use crate::graph::ModuleGraphError;
 use crate::graph::ModuleSlot;
 use crate::graph::Resolved;
 use crate::graph::SyntheticModule;
@@ -285,7 +285,7 @@ impl EsModule {
   }
 }
 
-impl ModuleGraphError {
+impl ModuleError {
   fn fmt_info<S: AsRef<str> + fmt::Display + Clone>(
     &self,
     f: &mut fmt::Formatter,
@@ -299,9 +299,6 @@ impl ModuleGraphError {
       Self::InvalidSource(_, _) => {
         fmt_error_msg(f, prefix, last, specifier, "(invalid source)")
       }
-      Self::InvalidTypeAssertion { .. } => {
-        fmt_error_msg(f, prefix, last, specifier, "(invalid import assertion)")
-      }
       Self::LoadingErr(_, _) => {
         fmt_error_msg(f, prefix, last, specifier, "(loading error)")
       }
@@ -311,13 +308,6 @@ impl ModuleGraphError {
       Self::ResolutionError(_) => {
         fmt_error_msg(f, prefix, last, specifier, "(resolution error)")
       }
-      Self::UnsupportedImportAssertionType(_, _) => fmt_error_msg(
-        f,
-        prefix,
-        last,
-        specifier,
-        "(unsupported import assertion)",
-      ),
       Self::UnsupportedMediaType(_, _) => {
         fmt_error_msg(f, prefix, last, specifier, "(unsupported)")
       }

@@ -17,6 +17,7 @@ use deno_ast::MediaType;
 use deno_ast::ParsedSource;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
+use lazy_static::lazy_static;
 use serde::ser::SerializeMap;
 use serde::ser::SerializeSeq;
 use serde::ser::SerializeStruct;
@@ -32,6 +33,14 @@ use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 use std::sync::Arc;
+
+lazy_static! {
+  static ref SUPPORTED_ASSERT_TYPES: HashMap<String, MediaType> = {
+    let mut map = HashMap::new();
+    map.insert("json".to_string(), MediaType::Json);
+    map
+  };
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Position {
@@ -123,22 +132,16 @@ impl Range {
 }
 
 #[derive(Debug)]
-pub enum ModuleGraphError {
+pub enum ModuleError {
   InvalidSource(ModuleSpecifier, Option<String>),
-  InvalidTypeAssertion {
-    specifier: ModuleSpecifier,
-    actual_media_type: MediaType,
-    expected_media_type: MediaType,
-  },
   LoadingErr(ModuleSpecifier, Arc<anyhow::Error>),
   Missing(ModuleSpecifier),
   ParseErr(ModuleSpecifier, deno_ast::Diagnostic),
   ResolutionError(ResolutionError),
-  UnsupportedImportAssertionType(ModuleSpecifier, String),
   UnsupportedMediaType(ModuleSpecifier, MediaType),
 }
 
-impl Clone for ModuleGraphError {
+impl Clone for ModuleError {
   fn clone(&self) -> Self {
     match self {
       Self::LoadingErr(specifier, err) => {
@@ -151,18 +154,6 @@ impl Clone for ModuleGraphError {
       Self::InvalidSource(specifier, maybe_filename) => {
         Self::InvalidSource(specifier.clone(), maybe_filename.clone())
       }
-      Self::InvalidTypeAssertion {
-        specifier,
-        actual_media_type,
-        expected_media_type,
-      } => Self::InvalidTypeAssertion {
-        specifier: specifier.clone(),
-        actual_media_type: *actual_media_type,
-        expected_media_type: *expected_media_type,
-      },
-      Self::UnsupportedImportAssertionType(specifier, kind) => {
-        Self::UnsupportedImportAssertionType(specifier.clone(), kind.clone())
-      }
       Self::UnsupportedMediaType(specifier, media_type) => {
         Self::UnsupportedMediaType(specifier.clone(), *media_type)
       }
@@ -171,7 +162,7 @@ impl Clone for ModuleGraphError {
   }
 }
 
-impl ModuleGraphError {
+impl ModuleError {
   #[cfg(feature = "rust")]
   pub fn specifier(&self) -> &ModuleSpecifier {
     match self {
@@ -180,16 +171,14 @@ impl ModuleGraphError {
       | Self::ParseErr(s, _)
       | Self::InvalidSource(s, _)
       | Self::UnsupportedMediaType(s, _)
-      | Self::UnsupportedImportAssertionType(s, _)
       | Self::Missing(s) => s,
-      Self::InvalidTypeAssertion { specifier, .. } => specifier,
     }
   }
 }
 
-impl std::error::Error for ModuleGraphError {}
+impl std::error::Error for ModuleError {}
 
-impl fmt::Display for ModuleGraphError {
+impl fmt::Display for ModuleError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
       Self::LoadingErr(_, err) => err.fmt(f),
@@ -197,16 +186,14 @@ impl fmt::Display for ModuleGraphError {
       Self::ResolutionError(err) => err.fmt(f),
       Self::InvalidSource(specifier, Some(filename)) => write!(f, "The source code is invalid, as it does not match the expected hash in the lock file.\n  Specifier: {}\n  Lock file: {}", specifier, filename),
       Self::InvalidSource(specifier, None) => write!(f, "The source code is invalid, as it does not match the expected hash in the lock file.\n  Specifier: {}", specifier),
-      Self::InvalidTypeAssertion { specifier, actual_media_type, expected_media_type } => write!(f, "Expected a {} module, but identified a {} module.\n  Specifier: {}", expected_media_type, actual_media_type, specifier),
       Self::UnsupportedMediaType(specifier, MediaType::Json) => write!(f, "Expected a JavaScript or TypeScript module, but identified a Json module. Consider importing Json modules with an import assertion with the type of \"json\".\n  Specifier: {}", specifier),
       Self::UnsupportedMediaType(specifier, media_type) => write!(f, "Expected a JavaScript or TypeScript module, but identified a {} module. Importing these types of modules is currently not supported.\n  Specifier: {}", media_type, specifier),
-      Self::UnsupportedImportAssertionType(_, kind) => write!(f, "The import assertion type of \"{}\" is unsupported.", kind),
       Self::Missing(specifier) => write!(f, "Module not found \"{}\".", specifier),
     }
   }
 }
 
-impl<'a> From<&'a ResolutionError> for ModuleGraphError {
+impl<'a> From<&'a ResolutionError> for ModuleError {
   fn from(err: &'a ResolutionError) -> Self {
     Self::ResolutionError(err.clone())
   }
@@ -284,6 +271,48 @@ impl fmt::Display for ResolutionError {
   }
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub enum ImportAssertionError {
+  TypeFailed {
+    actual_media_type: MediaType,
+    expected_media_type: MediaType,
+    specifier: ModuleSpecifier,
+    range: Range,
+  },
+  TypeInvalid(String, Range),
+}
+
+impl std::error::Error for ImportAssertionError {}
+
+impl fmt::Display for ImportAssertionError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match &self {
+      ImportAssertionError::TypeFailed { specifier, actual_media_type: MediaType::Json, expected_media_type, .. } => write!(f, "Expected a {} module, but identified a Json module. Consider importing Json modules with an import assertion with the type of \"json\".\n  Specifier: {}", expected_media_type, specifier),
+      ImportAssertionError::TypeFailed { specifier, actual_media_type, expected_media_type, .. } => write!(f, "Expected a {} module, but identified a {} module.\n  Specifier: {}", expected_media_type, actual_media_type, specifier),
+      ImportAssertionError::TypeInvalid(assert_type, ..) => write!(f, "The import assertion type of \"{}\" is unsupported.", assert_type),
+    }
+  }
+}
+
+#[derive(Clone, Debug)]
+pub enum ModuleGraphError {
+  Module(ModuleError),
+  Resolution(ResolutionError),
+  ImportAssertion(ImportAssertionError),
+}
+
+impl std::error::Error for ModuleGraphError {}
+
+impl fmt::Display for ModuleGraphError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match &self {
+      ModuleGraphError::Module(error) => error.fmt(f),
+      ModuleGraphError::Resolution(error) => error.fmt(f),
+      ModuleGraphError::ImportAssertion(error) => error.fmt(f),
+    }
+  }
+}
+
 pub type Resolved = Option<Result<(ModuleSpecifier, Range), ResolutionError>>;
 
 fn serialize_resolved<S>(
@@ -318,6 +347,14 @@ fn is_media_type_unknown(media_type: &MediaType) -> bool {
   matches!(media_type, MediaType::Unknown)
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct Import {
+  assertions: HashMap<String, String>,
+  assertions_result: Result<(), ImportAssertionError>,
+  is_dynamic: bool,
+  range: Range,
+}
+
 #[derive(Debug, Default, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Dependency {
@@ -335,8 +372,7 @@ pub struct Dependency {
   pub maybe_type: Resolved,
   #[serde(skip_serializing_if = "is_false")]
   pub is_dynamic: bool,
-  #[serde(rename = "assertType", skip_serializing_if = "Option::is_none")]
-  pub maybe_assert_type: Option<String>,
+  pub imports: Vec<Import>,
 }
 
 #[cfg(feature = "rust")]
@@ -583,9 +619,12 @@ pub(crate) enum ModuleSlot {
   /// A module, with source code.
   Module(Module),
   /// When trying to load or parse the module, an error occurred.
-  Err(ModuleGraphError),
+  Err(ModuleError),
   /// The module was requested but could not be loaded.
   Missing,
+  /// The module has been loaded, but a referrer with satisfied assertions has
+  /// not been found.
+  NoPassingImportAssertions(LoadResponse),
   /// An internal state set when loading a module asynchronously.
   Pending,
 }
@@ -599,7 +638,7 @@ impl ModuleSlot {
 #[cfg(feature = "rust")]
 type ModuleResult = (
   ModuleSpecifier,
-  Result<(ModuleSpecifier, MediaType), ModuleGraphError>,
+  Result<(ModuleSpecifier, MediaType), ModuleError>,
 );
 
 /// Convert a module slot entry into a result which contains the resolved
@@ -612,7 +651,7 @@ fn to_result(
     ModuleSlot::Err(err) => Some((specifier.clone(), Err(err.clone()))),
     ModuleSlot::Missing => Some((
       specifier.clone(),
-      Err(ModuleGraphError::Missing(specifier.clone())),
+      Err(ModuleError::Missing(specifier.clone())),
     )),
     ModuleSlot::Module(Module::Es(module)) => Some((
       specifier.clone(),
@@ -621,6 +660,10 @@ fn to_result(
     ModuleSlot::Module(Module::Synthetic(module)) => Some((
       specifier.clone(),
       Ok((module.specifier.clone(), module.media_type)),
+    )),
+    ModuleSlot::NoPassingImportAssertions(_) => Some((
+      specifier.clone(),
+      Err(ModuleError::Missing(specifier.clone())),
     )),
     _ => None,
   }
@@ -667,13 +710,13 @@ impl ModuleGraph {
 
   /// Returns any errors that are in the module graph.
   #[cfg(feature = "rust")]
-  pub fn errors(&self) -> Vec<ModuleGraphError> {
+  pub fn errors(&self) -> Vec<ModuleError> {
     self
       .module_slots
       .iter()
       .filter_map(|(s, ms)| match ms {
         ModuleSlot::Err(err) => Some(err.clone()),
-        ModuleSlot::Missing => Some(ModuleGraphError::Missing(s.clone())),
+        ModuleSlot::Missing => Some(ModuleError::Missing(s.clone())),
         _ => None,
       })
       .collect()
@@ -696,7 +739,7 @@ impl ModuleGraph {
   /// the integrity of all the sources passes or if there is no locker supplied
   /// the method results in an ok, otherwise returns an error which indicates
   /// the first specifier that failed the integrity check.
-  pub fn lock(&self) -> Result<(), ModuleGraphError> {
+  pub fn lock(&self) -> Result<(), ModuleError> {
     if let Some(locker) = &self.maybe_locker {
       let mut locker = locker.borrow_mut();
       for (_, module_slot) in self.module_slots.iter() {
@@ -711,7 +754,7 @@ impl ModuleGraph {
           _ => None,
         } {
           if !locker.check_or_insert(specifier, source) {
-            return Err(ModuleGraphError::InvalidSource(
+            return Err(ModuleError::InvalidSource(
               specifier.clone(),
               locker.get_filename(),
             ));
@@ -896,13 +939,11 @@ impl ModuleGraph {
   #[cfg(feature = "rust")]
   pub fn specifiers(
     &self,
-  ) -> HashMap<
-    ModuleSpecifier,
-    Result<(ModuleSpecifier, MediaType), ModuleGraphError>,
-  > {
+  ) -> HashMap<ModuleSpecifier, Result<(ModuleSpecifier, MediaType), ModuleError>>
+  {
     let mut map: HashMap<
       ModuleSpecifier,
-      Result<(ModuleSpecifier, MediaType), ModuleGraphError>,
+      Result<(ModuleSpecifier, MediaType), ModuleError>,
     > = self.module_slots.iter().filter_map(to_result).collect();
     for (specifier, found) in &self.redirects {
       map.insert(specifier.clone(), map.get(found).unwrap().clone());
@@ -918,13 +959,14 @@ impl ModuleGraph {
   pub fn try_get(
     &self,
     specifier: &ModuleSpecifier,
-  ) -> Result<Option<&Module>, ModuleGraphError> {
+  ) -> Result<Option<&Module>, ModuleError> {
     let specifier = self.resolve(specifier);
     match self.module_slots.get(&specifier) {
       Some(ModuleSlot::Module(module)) => Ok(Some(module)),
       Some(ModuleSlot::Err(err)) => Err(err.clone()),
-      Some(ModuleSlot::Missing) => {
-        Err(ModuleGraphError::Missing(specifier.clone()))
+      Some(ModuleSlot::Missing) => Err(ModuleError::Missing(specifier.clone())),
+      Some(ModuleSlot::NoPassingImportAssertions(_)) => {
+        Err(ModuleError::Missing(specifier.clone()))
       }
       _ => Ok(None),
     }
@@ -959,7 +1001,7 @@ impl ModuleGraph {
       get_module: &F,
     ) -> Result<(), ModuleGraphError>
     where
-      F: Fn(&ModuleSpecifier) -> Result<Option<Module>, ModuleGraphError>,
+      F: Fn(&ModuleSpecifier) -> Result<Option<Module>, ModuleError>,
     {
       if seen.contains(specifier) {
         return Ok(());
@@ -975,22 +1017,28 @@ impl ModuleGraph {
           }
           for dep in module.dependencies.values() {
             if !dep.is_dynamic {
-              // TODO(@kitsonk) eliminate duplication with maybe_code below
               match &dep.maybe_type {
                 Some(Ok((specifier, _))) => {
                   validate(specifier, types_only, true, seen, get_module)?
                 }
                 Some(Err(err)) if types_only => {
-                  return Err(err.into());
+                  return Err(ModuleGraphError::Resolution(err.clone()));
                 }
                 _ => (),
               }
               match &dep.maybe_code {
                 Some(Ok((specifier, _))) => {
+                  for import in &dep.imports {
+                    if let Err(error) = &import.assertions_result {
+                      return Err(ModuleGraphError::ImportAssertion(
+                        error.clone(),
+                      ));
+                    }
+                  }
                   validate(specifier, types_only, false, seen, get_module)?
                 }
                 Some(Err(err)) if !types_only => {
-                  return Err(err.into());
+                  return Err(ModuleGraphError::Resolution(err.clone()));
                 }
                 _ => (),
               }
@@ -998,10 +1046,10 @@ impl ModuleGraph {
           }
           Ok(())
         }
-        Ok(None) if should_error => {
-          Err(ModuleGraphError::Missing(specifier.clone()))
-        }
-        Err(err) if should_error => Err(err),
+        Ok(None) if should_error => Err(ModuleGraphError::Module(
+          ModuleError::Missing(specifier.clone()),
+        )),
+        Err(err) if should_error => Err(ModuleGraphError::Module(err)),
         _ => Ok(()),
       }
     }
@@ -1079,48 +1127,11 @@ pub(crate) fn parse_module(
   specifier: &ModuleSpecifier,
   maybe_headers: Option<&HashMap<String, String>>,
   content: Arc<String>,
-  maybe_assert_type: Option<&str>,
   maybe_resolver: Option<&dyn Resolver>,
   source_parser: &dyn SourceParser,
   is_root: bool,
-  is_dynamic_branch: bool,
 ) -> ModuleSlot {
   let media_type = get_media_type(specifier, maybe_headers);
-
-  // here we check any media types that should have assertions made against them
-  // if they aren't the root and add them to the graph, otherwise we continue
-  if media_type == MediaType::Json
-    && (is_root
-      || is_dynamic_branch
-      || matches!(maybe_assert_type, Some("json")))
-  {
-    return ModuleSlot::Module(Module::Synthetic(Box::new(
-      SyntheticModule::new(
-        specifier.clone(),
-        MediaType::Json,
-        None,
-        Some(content),
-        None,
-      ),
-    )));
-  }
-
-  match maybe_assert_type {
-    Some("json") => {
-      return ModuleSlot::Err(ModuleGraphError::InvalidTypeAssertion {
-        specifier: specifier.clone(),
-        actual_media_type: media_type,
-        expected_media_type: MediaType::Json,
-      })
-    }
-    Some(assert_type) => {
-      return ModuleSlot::Err(ModuleGraphError::UnsupportedImportAssertionType(
-        specifier.clone(),
-        assert_type.to_string(),
-      ))
-    }
-    _ => (),
-  }
 
   // Here we check for known ES Modules that we will analyze the dependencies of
   match &media_type {
@@ -1146,11 +1157,21 @@ pub(crate) fn parse_module(
             maybe_resolver,
           ))
         }
-        Err(diagnostic) => ModuleSlot::Err(ModuleGraphError::ParseErr(
-          specifier.clone(),
-          diagnostic,
-        )),
+        Err(diagnostic) => {
+          ModuleSlot::Err(ModuleError::ParseErr(specifier.clone(), diagnostic))
+        }
       }
+    }
+    MediaType::Json => {
+      return ModuleSlot::Module(Module::Synthetic(Box::new(
+        SyntheticModule::new(
+          specifier.clone(),
+          MediaType::Json,
+          None,
+          Some(content),
+          None,
+        ),
+      )));
     }
     MediaType::Unknown if is_root => {
       match source_parser.parse_module(
@@ -1167,13 +1188,12 @@ pub(crate) fn parse_module(
             maybe_resolver,
           ))
         }
-        Err(diagnostic) => ModuleSlot::Err(ModuleGraphError::ParseErr(
-          specifier.clone(),
-          diagnostic,
-        )),
+        Err(diagnostic) => {
+          ModuleSlot::Err(ModuleError::ParseErr(specifier.clone(), diagnostic))
+        }
       }
     }
-    _ => ModuleSlot::Err(ModuleGraphError::UnsupportedMediaType(
+    _ => ModuleSlot::Err(ModuleError::UnsupportedMediaType(
       specifier.clone(),
       media_type,
     )),
@@ -1294,32 +1314,50 @@ pub(crate) fn parse_module_from_ast(
     let dep = module
       .dependencies
       .entry(desc.specifier.to_string())
-      .or_default();
-    dep.is_dynamic = desc.is_dynamic;
-    dep.maybe_assert_type = desc.import_assertions.get("type").cloned();
-    let resolved_dependency = resolve(
-      &desc.specifier,
-      &Range::from_swc_span(
-        &module.specifier,
-        parsed_source,
-        &desc.specifier_span,
-      ),
-      maybe_resolver,
-    );
-    dep.maybe_code = resolved_dependency;
-    let specifier = module.specifier.clone();
-    let maybe_type = analyze_deno_types(&desc)
-      .map(|(text, span)| {
-        resolve(
-          &text,
-          &Range::from_swc_span(&specifier, parsed_source, &span),
+      .or_insert_with(|| {
+        let maybe_code = resolve(
+          &desc.specifier,
+          &Range::from_swc_span(
+            &module.specifier,
+            parsed_source,
+            &desc.specifier_span,
+          ),
           maybe_resolver,
-        )
-      })
-      .unwrap_or_else(|| Resolved::None);
+        );
+        Dependency {
+          maybe_code,
+          maybe_type: None,
+          is_dynamic: true,
+          imports: vec![],
+        }
+      });
+    let specifier = module.specifier.clone();
     if dep.maybe_type.is_none() {
-      dep.maybe_type = maybe_type
+      let maybe_type = analyze_deno_types(&desc)
+        .map(|(text, span)| {
+          resolve(
+            &text,
+            &Range::from_swc_span(&specifier, parsed_source, &span),
+            maybe_resolver,
+          )
+        })
+        .unwrap_or_else(|| Resolved::None);
+      dep.maybe_type = maybe_type;
     }
+    dep.is_dynamic = dep.is_dynamic && desc.is_dynamic;
+    let range = Range::from_swc_span(&specifier, parsed_source, &desc.span);
+    let assertions_result = match desc.import_assertions.get("type") {
+      Some(type_) if !SUPPORTED_ASSERT_TYPES.contains_key(type_) => Err(
+        ImportAssertionError::TypeInvalid(type_.clone(), range.clone()),
+      ),
+      _ => Ok(()),
+    };
+    dep.imports.push(Import {
+      assertions: desc.import_assertions.clone(),
+      assertions_result,
+      is_dynamic: desc.is_dynamic,
+      range,
+    });
   }
 
   // Return the module as a valid module
@@ -1350,14 +1388,62 @@ fn is_untyped(media_type: &MediaType) -> bool {
   )
 }
 
+struct PendingImport {
+  assertions: HashMap<String, String>,
+  import_specifier: String,
+  is_dynamic: bool,
+  range: Range,
+}
+
+fn check_assertions(
+  specifier: &ModuleSpecifier,
+  actual_media_type: MediaType,
+  pending_import: &PendingImport,
+) -> Result<(), ImportAssertionError> {
+  // Skip assertion checks for dynamic imports for now.
+  if pending_import.is_dynamic {
+    return Ok(());
+  }
+  match pending_import.assertions.get("type") {
+    Some(type_) => {
+      let expected_media_type = *SUPPORTED_ASSERT_TYPES
+        .get(type_)
+        .expect("assertions should have been validated");
+      if actual_media_type != expected_media_type {
+        Err(ImportAssertionError::TypeFailed {
+          actual_media_type,
+          expected_media_type,
+          specifier: specifier.clone(),
+          range: pending_import.range.clone(),
+        })
+      } else {
+        Ok(())
+      }
+    }
+    None
+      if SUPPORTED_ASSERT_TYPES
+        .values()
+        .any(|t| t == &actual_media_type) =>
+    {
+      Err(ImportAssertionError::TypeFailed {
+        actual_media_type,
+        expected_media_type: MediaType::JavaScript,
+        specifier: specifier.clone(),
+        range: pending_import.range.clone(),
+      })
+    }
+    _ => Ok(()),
+  }
+}
+
 pub(crate) struct Builder<'a> {
   in_dynamic_branch: bool,
   graph: ModuleGraph,
   loader: &'a mut dyn Loader,
   maybe_resolver: Option<&'a dyn Resolver>,
   pending: FuturesUnordered<LoadFuture>,
-  pending_assert_types: HashMap<ModuleSpecifier, HashSet<Option<String>>>,
-  dynamic_branches: HashMap<ModuleSpecifier, Option<String>>,
+  pending_imports: HashMap<ModuleSpecifier, Vec<PendingImport>>,
+  dynamic_branches: HashSet<ModuleSpecifier>,
   source_parser: &'a dyn SourceParser,
 }
 
@@ -1376,8 +1462,8 @@ impl<'a> Builder<'a> {
       loader,
       maybe_resolver,
       pending: FuturesUnordered::new(),
-      pending_assert_types: HashMap::new(),
-      dynamic_branches: HashMap::new(),
+      pending_imports: HashMap::new(),
+      dynamic_branches: HashSet::new(),
       source_parser,
     }
   }
@@ -1388,7 +1474,7 @@ impl<'a> Builder<'a> {
   ) -> ModuleGraph {
     let roots = self.graph.roots.clone();
     for root in roots {
-      self.load(&root, self.in_dynamic_branch, None);
+      self.load(&root, self.in_dynamic_branch);
     }
 
     // Process any imports that are being added to the graph.
@@ -1404,7 +1490,7 @@ impl<'a> Builder<'a> {
         for (specifier, _) in
           synthetic_module.dependencies.values().flatten().flatten()
         {
-          self.load(specifier, self.in_dynamic_branch, None);
+          self.load(specifier, self.in_dynamic_branch);
         }
         self.graph.module_slots.insert(
           referrer,
@@ -1416,11 +1502,7 @@ impl<'a> Builder<'a> {
     loop {
       match self.pending.next().await {
         Some((specifier, Ok(Some(response)))) => {
-          let assert_types =
-            self.pending_assert_types.remove(&specifier).unwrap();
-          for maybe_assert_type in assert_types {
-            self.visit(&specifier, &response, maybe_assert_type)
-          }
+          self.visit(&specifier, &response);
         }
         Some((specifier, Ok(None))) => {
           self
@@ -1431,10 +1513,7 @@ impl<'a> Builder<'a> {
         Some((specifier, Err(err))) => {
           self.graph.module_slots.insert(
             specifier.clone(),
-            ModuleSlot::Err(ModuleGraphError::LoadingErr(
-              specifier,
-              Arc::new(err),
-            )),
+            ModuleSlot::Err(ModuleError::LoadingErr(specifier, Arc::new(err))),
           );
         }
         _ => {}
@@ -1449,11 +1528,9 @@ impl<'a> Builder<'a> {
         //   visiting a dynamic branch.
         if !self.in_dynamic_branch {
           self.in_dynamic_branch = true;
-          for (specifier, maybe_assert_type) in
-            std::mem::take(&mut self.dynamic_branches)
-          {
+          for specifier in std::mem::take(&mut self.dynamic_branches) {
             if !self.graph.module_slots.contains_key(&specifier) {
-              self.load(&specifier, true, maybe_assert_type.as_deref());
+              self.load(&specifier, true);
             }
           }
         } else {
@@ -1475,18 +1552,8 @@ impl<'a> Builder<'a> {
   }
 
   /// Enqueue a request to load the specifier via the loader.
-  fn load(
-    &mut self,
-    specifier: &ModuleSpecifier,
-    is_dynamic: bool,
-    maybe_assert_type: Option<&str>,
-  ) {
+  fn load(&mut self, specifier: &ModuleSpecifier, is_dynamic: bool) {
     let specifier = self.graph.redirects.get(specifier).unwrap_or(specifier);
-    let assert_types = self
-      .pending_assert_types
-      .entry(specifier.clone())
-      .or_default();
-    assert_types.insert(maybe_assert_type.map(String::from));
     if !self.graph.module_slots.contains_key(specifier) {
       self
         .graph
@@ -1501,67 +1568,155 @@ impl<'a> Builder<'a> {
     &mut self,
     requested_specifier: &ModuleSpecifier,
     response: &LoadResponse,
-    maybe_assert_type: Option<String>,
   ) {
     let maybe_headers = response.maybe_headers.as_ref();
     let specifier = response.specifier.clone();
 
     // If the response was redirected, then we add the module to the redirects
-    if *requested_specifier != specifier {
-      // remove a potentially pending redirect that will never resolve
-      if let Some(slot) = self.graph.module_slots.get(requested_specifier) {
-        if matches!(slot, ModuleSlot::Pending) {
-          self.graph.module_slots.remove(requested_specifier);
-        }
-      }
+    if *requested_specifier != specifier
+      && !self.graph.redirects.contains_key(requested_specifier)
+    {
+      self.graph.module_slots.remove(requested_specifier);
       self
         .graph
         .redirects
         .insert(requested_specifier.clone(), specifier.clone());
+      if let Some(imports) = self.pending_imports.remove(requested_specifier) {
+        let entry = self.pending_imports.entry(specifier.clone()).or_default();
+        entry.extend(imports);
+      }
     }
 
     let is_root = self.graph.roots.contains(&specifier);
 
-    let module_slot = parse_module(
+    match self.graph.module_slots.get(&specifier) {
+      None | Some(ModuleSlot::Pending) => {
+        let pending_imports = match self.pending_imports.get_mut(&specifier) {
+          Some(pending_imports) => std::mem::take(pending_imports),
+          None => vec![],
+        };
+        if !is_root && !pending_imports.is_empty() {
+          let mut has_passing_assertions = false;
+          for pending_import in pending_imports {
+            let referrer_module = match self
+              .graph
+              .module_slots
+              .get_mut(&pending_import.range.specifier)
+            {
+              Some(ModuleSlot::Module(Module::Es(es_module))) => es_module,
+              _ => unreachable!(),
+            };
+            let referrer_dependency = referrer_module
+              .dependencies
+              .get_mut(&pending_import.import_specifier)
+              .unwrap();
+            let referrer_import = referrer_dependency
+              .imports
+              .iter_mut()
+              .find(|i| i.range == pending_import.range)
+              .unwrap();
+            if referrer_import.assertions_result.is_ok() {
+              match check_assertions(
+                &response.specifier,
+                get_media_type(
+                  &response.specifier,
+                  response.maybe_headers.as_ref(),
+                ),
+                &pending_import,
+              ) {
+                Ok(_) => has_passing_assertions = true,
+                Err(error) => referrer_import.assertions_result = Err(error),
+              }
+            }
+          }
+          if !has_passing_assertions {
+            self.graph.module_slots.insert(
+              specifier.clone(),
+              ModuleSlot::NoPassingImportAssertions(response.clone()),
+            );
+            return;
+          }
+        }
+      }
+      _ => return,
+    }
+
+    let mut module_slot = parse_module(
       &specifier,
       maybe_headers,
       response.content.clone(),
-      maybe_assert_type.as_deref(),
       self.maybe_resolver,
       self.source_parser,
       is_root,
-      self.in_dynamic_branch,
     );
 
-    if let ModuleSlot::Module(Module::Es(module)) = &module_slot {
-      for dep in module.dependencies.values() {
-        // Queue up dynamic dependencies to be visited later, unless we are
-        // already visiting a dynamic branch.
-        if dep.is_dynamic && !self.in_dynamic_branch {
-          if let Some(Ok((specifier, _))) = &dep.maybe_code {
-            self
-              .dynamic_branches
-              .insert(specifier.clone(), dep.maybe_assert_type.clone());
+    if let ModuleSlot::Module(Module::Es(module)) = &mut module_slot {
+      for (import_specifier, dep) in &mut module.dependencies {
+        if let Some(Ok((specifier, _))) = &dep.maybe_code {
+          if dep.is_dynamic && !self.in_dynamic_branch {
+            self.dynamic_branches.insert(specifier.clone());
+          } else {
+            self.load(specifier, self.in_dynamic_branch);
           }
-          if let Some(Ok((specifier, _))) = &dep.maybe_type {
-            self
-              .dynamic_branches
-              .insert(specifier.clone(), dep.maybe_assert_type.clone());
+          let specifier =
+            self.graph.redirects.get(specifier).unwrap_or(specifier);
+          let module_slot = self.graph.module_slots.get_mut(specifier);
+          match &module_slot {
+            None
+            | Some(
+              ModuleSlot::Pending | ModuleSlot::NoPassingImportAssertions(_),
+            ) => {
+              let pending_imports =
+                self.pending_imports.entry(specifier.clone()).or_default();
+              for import in &dep.imports {
+                pending_imports.push(PendingImport {
+                  assertions: import.assertions.clone(),
+                  import_specifier: import_specifier.clone(),
+                  is_dynamic: import.is_dynamic,
+                  range: import.range.clone(),
+                });
+              }
+              if let Some(module_slot) = module_slot {
+                // New imports have been found for a
+                // `ModuleSlot::NoPassingImportAssertions`, schedule a revisit.
+                let old_slot =
+                  std::mem::replace(module_slot, ModuleSlot::Pending);
+                match old_slot {
+                  ModuleSlot::NoPassingImportAssertions(response) => {
+                    self.pending.push(Box::pin(async move {
+                      (response.specifier.clone(), Ok(Some(response)))
+                    }));
+                  }
+                  _ => *module_slot = old_slot,
+                }
+              }
+            }
+            Some(ModuleSlot::Module(module)) => {
+              for import in &mut dep.imports {
+                if import.assertions_result.is_ok() {
+                  if let Err(error) = check_assertions(
+                    specifier,
+                    *module.media_type(),
+                    &PendingImport {
+                      assertions: import.assertions.clone(),
+                      import_specifier: import_specifier.clone(),
+                      is_dynamic: import.is_dynamic,
+                      range: import.range.clone(),
+                    },
+                  ) {
+                    import.assertions_result = Err(error);
+                  }
+                }
+              }
+            }
+            _ => {}
           }
-        } else {
-          if let Some(Ok((specifier, _))) = &dep.maybe_code {
-            self.load(
-              specifier,
-              self.in_dynamic_branch,
-              dep.maybe_assert_type.as_deref(),
-            );
-          }
-          if let Some(Ok((specifier, _))) = &dep.maybe_type {
-            self.load(
-              specifier,
-              self.in_dynamic_branch,
-              dep.maybe_assert_type.as_deref(),
-            );
+        }
+        if let Some(Ok((specifier, _))) = &dep.maybe_type {
+          if dep.is_dynamic && !self.in_dynamic_branch {
+            self.dynamic_branches.insert(specifier.clone());
+          } else {
+            self.load(specifier, self.in_dynamic_branch);
           }
         }
       }
@@ -1569,7 +1724,7 @@ impl<'a> Builder<'a> {
       if let Some((_, Some(Ok((specifier, _))))) =
         &module.maybe_types_dependency
       {
-        self.load(specifier, false, None);
+        self.load(specifier, false);
       }
     }
     self.graph.module_slots.insert(specifier, module_slot);
@@ -1599,6 +1754,7 @@ impl<'a> Serialize for SerializeableDependency<'a> {
     if self.1.maybe_code.is_some() {
       let serializeable_resolved = SerializeableResolved(&self.1.maybe_code);
       map.serialize_entry("code", &serializeable_resolved)?;
+      map.serialize_entry("imports", &self.1.imports)?;
     }
     if self.1.maybe_type.is_some() {
       let serializeable_resolved = SerializeableResolved(&self.1.maybe_type);
@@ -1606,9 +1762,6 @@ impl<'a> Serialize for SerializeableDependency<'a> {
     }
     if self.1.is_dynamic {
       map.serialize_entry("isDynamic", &self.1.is_dynamic)?;
-    }
-    if self.1.maybe_assert_type.is_some() {
-      map.serialize_entry("assertionType", &self.1.maybe_assert_type)?;
     }
     map.end()
   }
@@ -1666,6 +1819,15 @@ impl<'a> Serialize for SerializeableModuleSlot<'a> {
         state.serialize_field(
           "error",
           "The module was missing and could not be loaded.",
+        )?;
+        state.end()
+      }
+      ModuleSlot::NoPassingImportAssertions(_) => {
+        let mut state = serializer.serialize_struct("ModuleSlot", 2)?;
+        state.serialize_field("specifier", self.0)?;
+        state.serialize_field(
+          "error",
+          "All referrers of this module have failing import assertions.",
         )?;
         state.end()
       }
@@ -1783,16 +1945,8 @@ mod tests {
     let specifier = ModuleSpecifier::parse("file:///a.ts").unwrap();
     let source_parser = ast::DefaultSourceParser::default();
     let content = Arc::new(r#"import * as b from "./b.ts";"#.to_string());
-    let slot = parse_module(
-      &specifier,
-      None,
-      content,
-      None,
-      None,
-      &source_parser,
-      true,
-      false,
-    );
+    let slot =
+      parse_module(&specifier, None, content, None, &source_parser, true);
     if let ModuleSlot::Module(Module::Es(module)) = slot {
       let maybe_dependency = module.dependencies.values().find_map(|d| {
         d.includes(&Position {
@@ -1976,7 +2130,7 @@ mod tests {
       graph
         .try_get(&Url::parse("file:///bar.js").unwrap())
         .unwrap_err(),
-      ModuleGraphError::Missing(..)
+      ModuleError::Missing(..)
     ));
     let specifiers = graph.specifiers();
     assert_eq!(specifiers.len(), 2);
@@ -1990,7 +2144,7 @@ mod tests {
         .unwrap()
         .as_ref()
         .unwrap_err(),
-      ModuleGraphError::Missing(..)
+      ModuleError::Missing(..)
     ));
   }
 
@@ -2057,7 +2211,7 @@ mod tests {
         .unwrap()
         .as_ref()
         .unwrap_err(),
-      ModuleGraphError::ParseErr(..)
+      ModuleError::ParseErr(..)
     ));
     assert!(matches!(
       specifiers
@@ -2065,7 +2219,7 @@ mod tests {
         .unwrap()
         .as_ref()
         .unwrap_err(),
-      ModuleGraphError::ParseErr(..)
+      ModuleError::ParseErr(..)
     ));
   }
 }

@@ -35,7 +35,7 @@ cfg_if! {
     pub use graph::EsModule;
     pub use graph::Module;
     pub use graph::ModuleGraph;
-    pub use graph::ModuleGraphError;
+    pub use graph::ModuleError;
     pub use graph::Position;
     pub use graph::Range;
     pub use graph::ResolutionError;
@@ -79,18 +79,16 @@ cfg_if! {
       content: Arc<String>,
       maybe_resolver: Option<&dyn Resolver>,
       maybe_parser: Option<&dyn SourceParser>,
-    ) -> Result<Module, ModuleGraphError> {
+    ) -> Result<Module, ModuleError> {
       let default_parser = ast::DefaultSourceParser::new();
       let source_parser = maybe_parser.unwrap_or(&default_parser);
       match graph::parse_module(
         specifier,
         maybe_headers,
         content,
-        None,
         maybe_resolver,
         source_parser,
         true,
-        false,
       ) {
         ModuleSlot::Module(module) => Ok(module),
         ModuleSlot::Err(err) => Err(err),
@@ -209,11 +207,9 @@ cfg_if! {
         &specifier,
         maybe_headers.as_ref(),
         Arc::new(content),
-        None,
         maybe_resolver.as_ref().map(|r| r as &dyn Resolver),
         &source_parser,
         true,
-        false,
       ) {
         ModuleSlot::Module(module) => Ok(js_graph::Module(module)),
         ModuleSlot::Err(err) => Err(js_sys::Error::new(&err.to_string()).into()),
@@ -226,6 +222,8 @@ cfg_if! {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::graph::ImportAssertionError;
+  use crate::graph::ModuleGraphError;
   use crate::graph::Resolved;
   use anyhow::Error;
   use pretty_assertions::assert_eq;
@@ -853,12 +851,20 @@ console.log(a);
     let result = graph.valid();
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert_eq!(err.specifier(), &root_specifier);
-    assert!(matches!(err, ModuleGraphError::ResolutionError(_)));
+    match err {
+      ModuleGraphError::Resolution(ResolutionError::InvalidSpecifier(
+        SpecifierError::ImportPrefixMissing(import_specifier, _),
+        referrer_range,
+      )) => {
+        assert_eq!(&import_specifier, "foo");
+        assert_eq!(&referrer_range.specifier, &root_specifier);
+      }
+      _ => panic!("{:?}", err),
+    }
   }
 
   #[tokio::test]
-  async fn test_unsupported_media_type() {
+  async fn test_import_assert_type_error() {
     let mut loader = setup(
       vec![
         (
@@ -887,10 +893,13 @@ console.log(a);
     let result = graph.valid();
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(matches!(
-      err,
-      ModuleGraphError::UnsupportedMediaType(_, MediaType::Json)
-    ));
+    match err {
+      ModuleGraphError::ImportAssertion(ImportAssertionError::TypeFailed {
+        actual_media_type: MediaType::Json,
+        ..
+      }) => {}
+      _ => panic!("{:?}", err),
+    }
   }
 
   #[tokio::test]
@@ -1009,7 +1018,7 @@ console.log(a);
             r#"
 /**
  * Some js doc
- * 
+ *
  * @param {import("./types.d.ts").A} a
  * @return {import("./other.ts").B}
  */
@@ -1094,7 +1103,7 @@ export function a(a) {
               }
             ],
             "mediaType": "JavaScript",
-            "size": 138,
+            "size": 137,
             "specifier": "file:///a/test.js"
           },
           {
@@ -1531,8 +1540,7 @@ export function a(a) {
                       "character": 36
                     }
                   }
-                },
-                "assertionType": "json"
+                }
               },
               {
                 "specifier": "./b.json",
@@ -1549,8 +1557,7 @@ export function a(a) {
                     }
                   }
                 },
-                "isDynamic": true,
-                "assertionType": "json"
+                "isDynamic": true
               },
               {
                 "specifier": "./c.json",
@@ -1566,8 +1573,7 @@ export function a(a) {
                       "character": 41
                     }
                   }
-                },
-                "assertionType": "json"
+                }
               },
               {
                 "specifier": "./d.json",
@@ -1651,16 +1657,15 @@ export function a(a) {
                   "specifier": "file:///a/a.json",
                   "span": {
                     "start": {
-                      "line": 2,
+                      "line": 1,
                       "character": 26
                     },
                     "end": {
-                      "line": 2,
+                      "line": 1,
                       "character": 36
                     }
                   }
-                },
-                "assertionType": "json"
+                }
               }
             ],
             "mediaType": "TypeScript",
@@ -1732,7 +1737,7 @@ export function a(a) {
         "modules": [
           {
             "specifier": "file:///a/a.json",
-            "error": "Expected a JavaScript or TypeScript module, but identified a Json module. Consider importing Json modules with an import assertion with the type of \"json\".\n  Specifier: file:///a/a.json"
+            "error": "All referrers of this module have failing import assertions."
           },
           {
             "size": 9,
@@ -1741,11 +1746,11 @@ export function a(a) {
           },
           {
             "specifier": "file:///a/c.js",
-            "error": "Expected a Json module, but identified a JavaScript module.\n  Specifier: file:///a/c.js"
+            "error": "All referrers of this module have failing import assertions."
           },
           {
             "specifier": "file:///a/d.json",
-            "error": "The import assertion type of \"css\" is unsupported."
+            "error": "All referrers of this module have failing import assertions."
           },
           {
             "specifier": "file:///a/e.wasm",
@@ -1783,8 +1788,7 @@ export function a(a) {
                       "character": 36
                     }
                   }
-                },
-                "assertionType": "json"
+                }
               },
               {
                 "specifier": "./c.js",
@@ -1800,8 +1804,7 @@ export function a(a) {
                       "character": 34
                     }
                   }
-                },
-                "assertionType": "json"
+                }
               },
               {
                 "specifier": "./d.json",
@@ -1817,8 +1820,7 @@ export function a(a) {
                       "character": 36
                     }
                   }
-                },
-                "assertionType": "css"
+                }
               },
               {
                 "specifier": "./e.wasm",
@@ -1911,8 +1913,7 @@ export function a(a) {
                   "character": 28
                 }
               }
-            },
-            "assertionType": "json"
+            }
           },
           {
             "specifier": "./b.json",
@@ -1929,8 +1930,7 @@ export function a(a) {
                 }
               }
             },
-            "isDynamic": true,
-            "assertionType": "json"
+            "isDynamic": true
           }
         ],
         "mediaType": "TypeScript",
@@ -2017,7 +2017,7 @@ export function a(a) {
         r#"
 /**
  * Some js doc
- * 
+ *
  * @param {import("./types.d.ts").A} a
  * @return {import("./other.ts").B}
  */
@@ -2070,7 +2070,7 @@ export function a(a) {
           }
         ],
         "mediaType": "JavaScript",
-        "size": 138,
+        "size": 137,
         "specifier": "file:///a/test.js"
       })
     );

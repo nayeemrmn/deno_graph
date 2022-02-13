@@ -339,7 +339,6 @@ Deno.test({
               },
             },
           },
-          "assertionType": "json",
         },
         {
           "specifier": "./b.json",
@@ -357,7 +356,6 @@ Deno.test({
             },
           },
           "isDynamic": true,
-          "assertionType": "json",
         },
       ],
       "mediaType": "JavaScript",
